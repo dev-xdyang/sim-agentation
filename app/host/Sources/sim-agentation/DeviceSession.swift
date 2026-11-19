@@ -60,6 +60,11 @@ final class DeviceSession: @unchecked Sendable {
     private var reportedFailure = false
     private var idlePump: DispatchSourceTimer?
     private lazy var input = HIDInput(udid: udid)
+    /// Two-finger trackpad swipes arrive as wheel deltas, not a pointer drag.
+    /// One finger stays down and moves with those deltas, then lifts.
+    private var wheelAt: CGPoint?
+    private var wheelSize = CGSize(width: 1, height: 1)
+    private var wheelToken = 0
     /// iPhone Duo and its like: the stream follows the panel the hinge lights.
     private let foldable: Foldable?
     // A foldable drawn in 3D (see `DuoScene`), lock held: the scene, kept
@@ -664,6 +669,40 @@ final class DeviceSession: @unchecked Sendable {
         }
     }
 
+    /// A two-finger swipe keeps one finger down. The next wheel event moves
+    /// it, then a quiet moment lifts it. Deltas are already in screen points
+    /// and already follow System Settings → Trackpad → Scroll direction.
+    /// A positive delta means “scroll the content down”; the finger has to
+    /// move the other way for the screen to follow, so subtract it.
+    private func wheel(dx: Double, dy: Double, at origin: CGPoint, size: CGSize) {
+        if abs(dx) < 0.4 && abs(dy) < 0.4 { return }
+        if wheelAt == nil {
+            wheelSize = size
+            wheelAt = origin
+            input.touch(.down, at: origin, size: size)
+        }
+        var next = wheelAt ?? origin
+        let width = max(size.width, 1)
+        let height = max(size.height, 1)
+        next.x = min(max(next.x - dx, 0), width - 1)
+        next.y = min(max(next.y - dy, 0), height - 1)
+        wheelAt = next
+        input.touch(.move, at: next, size: size)
+        wheelToken += 1
+        let token = wheelToken
+        inputQueue.asyncAfter(deadline: .now() + .milliseconds(90)) { [weak self] in
+            guard let self, self.wheelToken == token else { return }
+            self.endWheel()
+        }
+    }
+
+    private func endWheel() {
+        guard let at = wheelAt else { return }
+        let size = wheelSize
+        wheelAt = nil
+        input.touch(.up, at: at, size: size)
+    }
+
     /// Runs on `inputQueue`: gestures block for their duration.
     private func perform(_ type: String, _ msg: [String: Any]) {
         func num(_ key: String) -> Double? { (msg[key] as? NSNumber)?.doubleValue }
@@ -683,12 +722,15 @@ final class DeviceSession: @unchecked Sendable {
             }
         case "touch1-down", "touch1-move", "touch1-up":
             let phase = TouchPhase(rawValue: String(type.dropFirst("touch1-".count)))!
+            if phase == .down { endWheel() }
             if let p = point("x", "y") { input.touch(phase, at: p, size: size, edge: edge) }
         case "touch2-down", "touch2-move", "touch2-up":
             let phase = TouchPhase(rawValue: String(type.dropFirst("touch2-".count)))!
             if let a = point("x1", "y1"), let b = point("x2", "y2") { input.touch2(phase, first: a, second: b, size: size) }
         case "scroll":
-            input.scroll(dx: num("deltaX") ?? 0, dy: num("deltaY") ?? 0)
+            if let origin = point("x", "y") {
+                wheel(dx: num("deltaX") ?? 0, dy: num("deltaY") ?? 0, at: origin, size: size)
+            }
         case "button":
             guard let name = msg["button"] as? String, let button = HardwareButton(rawValue: name) else { return }
             let hold = num("duration") ?? 0

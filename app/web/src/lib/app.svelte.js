@@ -200,8 +200,9 @@ function connect(udid) {
     syncView();
     ws.send(JSON.stringify({ type: 'snapshot' }));
     ws.send(JSON.stringify({ type: 'orientation', orientation: ui.orientation, sync: true }));
-    // Nudge with a harmless scroll so an idle screen still emits a frame.
-    setTimeout(() => !rt.frame && send({ type: 'scroll', deltaX: 0, deltaY: 0 }), 600);
+    // Do not send a scroll here. On iOS 27 that Indigo message aborts
+    // backboardd, which is the black spinner. The host already repeats a
+    // still frame.
     // Once video arrives, a working decoder shows something within moments
     // (the host re-encodes even a still screen 60 times a second). No video
     // at all, as while a simulator boots, is the host's to report.
@@ -659,7 +660,21 @@ export function onWheel(e) {
     if (!pinchFrame) pinchFrame = requestAnimationFrame(() => ((pinchFrame = 0), syncView()));
     return;
   }
-  if (ui.mode === 'interact') send({ type: 'scroll', deltaX: e.deltaX, deltaY: e.deltaY });
+  if (ui.mode === 'interact') {
+    if (rt.touching) return;
+    const { inside, ...point } = inputPoint(e);
+    if (!inside) return;
+    // Wheel deltas are CSS pixels of the picture. Turn them into screen
+    // points so a two-finger swipe moves as far as it looks.
+    const rect = e.currentTarget.getBoundingClientRect();
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) { dx *= 16; dy *= 16; }
+    else if (e.deltaMode === 2) { dx *= rect.width; dy *= rect.height; }
+    const sx = rect.width ? point.width / rect.width : 1;
+    const sy = rect.height ? point.height / rect.height : 1;
+    send({ type: 'scroll', ...point, deltaX: dx * sx, deltaY: dy * sy });
+  }
   else if (Math.abs(e.deltaY) > 2) changeLevel(e.deltaY < 0 ? 1 : -1);
 }
 
