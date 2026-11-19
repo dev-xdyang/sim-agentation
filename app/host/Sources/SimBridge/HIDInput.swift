@@ -61,7 +61,7 @@ public final class HIDInput: @unchecked Sendable {
         if phase == .down { activeTouch = nextTouchId() }
         let id = activeTouch ?? nextTouchId()
         if phase == .up { activeTouch = nil }
-        return Digitizer.send(normalized(point, size), id: id, phase: phase, edge: edge, target: target, to: c)
+        return finish(Digitizer.send(normalized(point, size), id: id, phase: phase, edge: edge, target: target, to: c))
     }
 
     @discardableResult
@@ -69,9 +69,9 @@ public final class HIDInput: @unchecked Sendable {
         guard let c = warm() else { return false }
         let id = nextTouchId()
         let p = normalized(point, size)
-        guard Digitizer.send(p, id: id, phase: .down, edge: nil, target: target, to: c) else { return false }
+        guard finish(Digitizer.send(p, id: id, phase: .down, edge: nil, target: target, to: c)) else { return false }
         usleep(UInt32(max(0.02, hold) * 1_000_000))
-        return Digitizer.send(p, id: id, phase: .up, edge: nil, target: target, to: c)
+        return finish(Digitizer.send(p, id: id, phase: .up, edge: nil, target: target, to: c))
     }
 
     @discardableResult
@@ -79,7 +79,7 @@ public final class HIDInput: @unchecked Sendable {
         guard let c = warm() else { return false }
         let steps = 10
         let stepMs = UInt32(max(8, duration * 1000 / Double(steps + 2)))
-        return Digitizer.swipe(from: normalized(start, size), to: normalized(end, size), steps: steps, stepMs: stepMs, edge: nil, id: nextTouchId(), target: target, to: c)
+        return finish(Digitizer.swipe(from: normalized(start, size), to: normalized(end, size), steps: steps, stepMs: stepMs, edge: nil, id: nextTouchId(), target: target, to: c))
     }
 
     /// Two-finger gestures (pinch, rotate) go through the mouse-event path.
@@ -100,19 +100,25 @@ public final class HIDInput: @unchecked Sendable {
                 }
             }
             if let msg {
-                Self.send(msg, to: c)
-                return true
+                return finish(Self.send(msg, to: c))
             }
             usleep(5_000)
         }
         return false
     }
 
+    /// A trackpad wheel. The constructor stores the service id at byte 0x30,
+    /// but a type-6 message is read from byte 0x20 and the id is taken at
+    /// 0x2c into that view (absolute 0x4c). That word is unset, so
+    /// `serviceForIndigoHIDData:` aborts backboardd. Fill it in and send the
+    /// real scroll; do not replace the wheel with a synthetic drag.
     @discardableResult
     public func scroll(dx: Double, dy: Double) -> Bool {
         guard let c = warm(), let scroll = Symbols.shared.scroll, let msg = scroll(target, dx, dy, 0) else { return false }
-        Self.send(msg, to: c)
-        return true
+        if malloc_size(msg) >= 0x50 {
+            msg.storeBytes(of: target, toByteOffset: 0x4c, as: UInt32.self)
+        }
+        return finish(Self.send(msg, to: c))
     }
 
     // MARK: - buttons and keys
@@ -129,7 +135,7 @@ public final class HIDInput: @unchecked Sendable {
             usleep(150_000)
             return legacyButton(0, holdUs: holdUs, on: c) && first
         case .swipeToHome:
-            return Digitizer.swipe(from: CGPoint(x: 0.5, y: 0.998), to: CGPoint(x: 0.5, y: 0.30), steps: 12, stepMs: 16, edge: .bottom, id: nextTouchId(), target: target, to: c)
+            return finish(Digitizer.swipe(from: CGPoint(x: 0.5, y: 0.998), to: CGPoint(x: 0.5, y: 0.30), steps: 12, stepMs: 16, edge: .bottom, id: nextTouchId(), target: target, to: c))
         case .power: return hid(page: 12, usage: 48, holdUs: holdUs, on: c)
         case .volumeUp: return hid(page: 12, usage: 233, holdUs: holdUs, on: c)
         case .volumeDown: return hid(page: 12, usage: 234, holdUs: holdUs, on: c)
@@ -143,16 +149,16 @@ public final class HIDInput: @unchecked Sendable {
         guard let c = warm(), let arbitrary = Symbols.shared.hidArbitrary else { return false }
         for m in modifiers {
             guard let down = arbitrary(target, 7, m, 1) else { return false }
-            Self.send(down, to: c)
+            guard finish(Self.send(down, to: c)) else { return false }
         }
         guard let down = arbitrary(target, 7, usage, 1) else { return false }
-        Self.send(down, to: c)
+        guard finish(Self.send(down, to: c)) else { return false }
         usleep(holdMicroseconds(hold == 0 ? 0.03 : hold))
         guard let up = arbitrary(target, 7, usage, 2) else { return false }
-        Self.send(up, to: c)
+        guard finish(Self.send(up, to: c)) else { return false }
         for m in modifiers.reversed() {
             guard let release = arbitrary(target, 7, m, 2) else { return false }
-            Self.send(release, to: c)
+            guard finish(Self.send(release, to: c)) else { return false }
         }
         return true
     }
@@ -176,20 +182,34 @@ public final class HIDInput: @unchecked Sendable {
 
     private func legacyButton(_ code: UInt32, holdUs: UInt32, on c: AnyObject) -> Bool {
         guard let button = Symbols.shared.button, let down = button(code, 1, 0x33) else { return false }
-        Self.send(down, to: c)
+        guard finish(Self.send(down, to: c)) else { return false }
         usleep(holdUs)
         guard let up = button(code, 2, 0x33) else { return false }
-        Self.send(up, to: c)
-        return true
+        return finish(Self.send(up, to: c))
     }
 
     private func hid(page: UInt32, usage: UInt32, holdUs: UInt32, on c: AnyObject) -> Bool {
         guard let arbitrary = Symbols.shared.hidArbitrary, let down = arbitrary(target, page, usage, 1) else { return false }
-        Self.send(down, to: c)
+        guard finish(Self.send(down, to: c)) else { return false }
         usleep(holdUs)
         guard let up = arbitrary(target, page, usage, 2) else { return false }
-        Self.send(up, to: c)
-        return true
+        return finish(Self.send(up, to: c))
+    }
+
+    /// A dead mach port or a timed-out send means this client cannot deliver
+    /// another event. Drop it so the next gesture builds a new one. Do not
+    /// restart backboardd here: that is `InputSurface.reclaim`, and it is
+    /// what paints the black spinner.
+    private func finish(_ delivered: Bool) -> Bool {
+        if !delivered { dropClient() }
+        return delivered
+    }
+
+    private func dropClient() {
+        lock.lock()
+        client = nil
+        activeTouch = nil
+        lock.unlock()
     }
 
     /// The SimDeviceLegacyHIDClient for this device, created once, with the
@@ -218,7 +238,7 @@ public final class HIDInput: @unchecked Sendable {
         }
         for create in [symbols.createPointerService, symbols.createMouseService] {
             if let create, let msg = create() {
-                Self.send(msg, to: c)
+                guard Self.send(msg, to: c) else { return nil }
                 usleep(20_000)
             }
         }
@@ -342,21 +362,19 @@ private enum Digitizer {
         }
         guard let message else { return false }
         patch(message, edge: edge, target: target)
-        HIDInput.send(message, to: client)
-        return true
+        return HIDInput.send(message, to: client)
     }
 
     static func swipe(from start: CGPoint, to end: CGPoint, steps: Int, stepMs: UInt32, edge: ScreenEdge?, id: UInt32, target: UInt32, to client: AnyObject) -> Bool {
         guard send(start, id: id, phase: .down, edge: edge, target: target, to: client) else { return false }
-        var moved = 0
         for i in 1...steps {
             usleep(stepMs * 1000)
             let t = Double(i) / Double(steps)
             let p = CGPoint(x: start.x + (end.x - start.x) * t, y: start.y + (end.y - start.y) * t)
-            if send(p, id: id, phase: .move, edge: edge, target: target, to: client) { moved += 1 }
+            guard send(p, id: id, phase: .move, edge: edge, target: target, to: client) else { return false }
         }
         usleep(stepMs * 1000)
-        return send(end, id: id, phase: .up, edge: edge, target: target, to: client) && moved >= steps / 2
+        return send(end, id: id, phase: .up, edge: edge, target: target, to: client)
     }
 
     /// Byte offsets inside the Indigo message, as found by baguette.
